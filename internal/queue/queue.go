@@ -1,9 +1,10 @@
-// Package queue implements a single-node, in-memory job queue.
+// Package queue implements a single-node job queue with disk persistence.
 //
-// This is Milestone 1 of the go-job-queue project. Jobs live only in
-// memory: there is no persistence, replication, or network API yet.
-// Delivery is at-least-once: a leased job that is not acknowledged
-// before its lease expires becomes available for leasing again.
+// This is Milestone 2 of the go-job-queue project. Jobs are stored in a
+// BoltDB file and reloaded on startup, so a restarted server resumes with
+// its queue intact. There is no replication or network API yet. Delivery
+// is at-least-once: a leased job that is not acknowledged before its
+// lease expires becomes available for leasing again.
 package queue
 
 import (
@@ -12,6 +13,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 // Job is a unit of work held by the queue.
@@ -40,33 +43,45 @@ type jobState struct {
 	leaseID   string
 	deadline  time.Time
 	completed bool
+	readySeq  uint64 // FIFO position while ready; 0 when leased
 }
 
-// Queue is a thread-safe, single-node, in-memory FIFO job queue.
+// Queue is a thread-safe, single-node job queue. When opened with Open,
+// jobs are persisted to disk on every mutation and reloaded on startup;
+// a queue built with New keeps jobs in memory only.
 type Queue struct {
 	mu           sync.Mutex
 	leaseTimeout time.Duration
 	sweepEvery   time.Duration
+	db           *bbolt.DB // nil for in-memory queues
 
-	byID   map[string]*jobState
-	byKey  map[string]string // idempotency key -> job ID
-	ready  []string          // job IDs waiting to be leased, FIFO order
-	leased map[string]string // lease ID -> job ID
+	byID         map[string]*jobState
+	byKey        map[string]string // idempotency key -> job ID
+	ready        []string          // job IDs waiting to be leased, FIFO order
+	leased       map[string]string // lease ID -> job ID
+	nextReadySeq uint64
 
 	stopCh chan struct{}
 	doneCh chan struct{}
 }
 
-// New returns an empty Queue. A non-positive leaseTimeout selects
-// DefaultLeaseTimeout. The queue runs a background sweeper that returns
-// expired leases to the ready list; call Stop to shut it down.
+// New returns an empty in-memory Queue. A non-positive leaseTimeout
+// selects DefaultLeaseTimeout. The queue runs a background sweeper that
+// returns expired leases to the ready list; call Stop to shut it down.
 func New(leaseTimeout time.Duration) *Queue {
+	return newQueue(leaseTimeout, nil)
+}
+
+// newQueue builds a Queue, optionally backed by db. The caller must hold
+// no lock; Open loads stored jobs after this returns.
+func newQueue(leaseTimeout time.Duration, db *bbolt.DB) *Queue {
 	if leaseTimeout <= 0 {
 		leaseTimeout = DefaultLeaseTimeout
 	}
 	q := &Queue{
 		leaseTimeout: leaseTimeout,
 		sweepEvery:   leaseTimeout / 2,
+		db:           db,
 		byID:         make(map[string]*jobState),
 		byKey:        make(map[string]string),
 		leased:       make(map[string]string),
@@ -105,11 +120,14 @@ func (q *Queue) Enqueue(payload []byte, idempotencyKey string) Job {
 		IdempotencyKey: idempotencyKey,
 		Payload:        payload,
 	}
-	q.byID[id] = &jobState{job: job}
+	st := &jobState{job: job, readySeq: q.nextReadySeq}
+	q.nextReadySeq++
+	q.byID[id] = st
 	if idempotencyKey != "" {
 		q.byKey[idempotencyKey] = id
 	}
 	q.ready = append(q.ready, id)
+	q.persistLocked(st)
 	return job
 }
 
@@ -131,8 +149,10 @@ func (q *Queue) Lease() (job Job, leaseID string, ok bool) {
 	st.leased = true
 	st.leaseID = newID()
 	st.deadline = time.Now().Add(q.leaseTimeout)
+	st.readySeq = 0
 	st.job.Attempts++
 	q.leased[st.leaseID] = id
+	q.persistLocked(st)
 	return st.job, st.leaseID, true
 }
 
@@ -154,6 +174,7 @@ func (q *Queue) Ack(leaseID string) error {
 	if st.job.IdempotencyKey != "" {
 		delete(q.byKey, st.job.IdempotencyKey)
 	}
+	q.deleteLocked(id)
 	return nil
 }
 
@@ -172,7 +193,10 @@ func (q *Queue) Nack(leaseID string) error {
 	st.leased = false
 	st.leaseID = ""
 	st.deadline = time.Time{}
+	st.readySeq = q.nextReadySeq
+	q.nextReadySeq++
 	q.ready = append(q.ready, id)
+	q.persistLocked(st)
 	return nil
 }
 
@@ -193,7 +217,10 @@ func (q *Queue) reclaimExpiredLocked(now time.Time) {
 			st.leased = false
 			st.leaseID = ""
 			st.deadline = time.Time{}
+			st.readySeq = q.nextReadySeq
+			q.nextReadySeq++
 			q.ready = append(q.ready, id)
+			q.persistLocked(st)
 		}
 	}
 }
