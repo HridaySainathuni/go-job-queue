@@ -1,10 +1,11 @@
 // Command server is the entry point for the go-job-queue node.
 //
-// Milestone 1 only wires up the single-node in-memory queue. There is no
-// network API, persistence, or replication yet.
+// Milestone 2 wires the queue to disk persistence: jobs survive a
+// restart of the server. There is no network API or replication yet.
 package main
 
 import (
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -14,10 +15,20 @@ import (
 )
 
 func main() {
-	q := queue.New(queue.DefaultLeaseTimeout)
-	defer q.Stop()
+	dataDir := flag.String("data", "data", "directory holding the queue database")
+	flag.Parse()
 
-	log.Printf("go-job-queue node ready (single-node, in-memory, lease timeout %s)", queue.DefaultLeaseTimeout)
+	q, err := queue.Open(*dataDir, queue.DefaultLeaseTimeout)
+	if err != nil {
+		log.Fatalf("open queue: %v", err)
+	}
+	defer func() {
+		if err := q.Close(); err != nil {
+			log.Printf("close queue: %v", err)
+		}
+	}()
+
+	log.Printf("go-job-queue node ready (single-node, persisted in %s, lease timeout %s)", *dataDir, queue.DefaultLeaseTimeout)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

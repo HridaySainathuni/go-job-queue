@@ -9,8 +9,21 @@ cluster.
 
 ## Status
 
-Milestone 1 is done: a single-node, in-memory queue. Jobs live only in
-memory. There is no persistence, replication, network API, or metrics yet.
+Milestone 2 is done: jobs persist to disk and survive a restart. The
+queue keeps the same API from Milestone 1.
+
+## Persistence
+
+- Backend: BoltDB (`go.etcd.io/bbolt` v1.4.0), a single embedded
+  key/value store. No separate database process is needed.
+- Data lives in `queue.db` inside the data directory. By default the
+  server uses a `data` directory in the working directory; pass
+  `-data <dir>` to use another one.
+- Every mutation (enqueue, lease, ack, nack) is written to disk before
+  it returns, so a crash loses no acknowledged job.
+- A restart resumes the queue: on startup the server reloads all
+  persisted jobs from `queue.db`, including lease state, and continues
+  with the same FIFO order, idempotency keys, and lease timeouts.
 
 ## What is built so far
 
@@ -26,7 +39,7 @@ memory. There is no persistence, replication, network API, or metrics yet.
 ## Planned milestones
 
 1. Single-node queue (done)
-2. Persistence
+2. Persistence (done)
 3. Raft replication
 4. Leases and retries
 5. Metrics
