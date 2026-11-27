@@ -131,6 +131,35 @@ func (q *Queue) Enqueue(payload []byte, idempotencyKey string) Job {
 	return job
 }
 
+// EnqueueApplied inserts a job whose ID was already assigned, as applied
+// from the replicated log. Every replica applies the same command, so
+// every replica stores the same job ID. Like Enqueue it is idempotent:
+// a job with the same idempotency key or the same ID is returned
+// unchanged instead of being stored twice.
+func (q *Queue) EnqueueApplied(job Job) Job {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if job.IdempotencyKey != "" {
+		if id, ok := q.byKey[job.IdempotencyKey]; ok {
+			return q.byID[id].job
+		}
+	}
+	if st, ok := q.byID[job.ID]; ok {
+		return st.job
+	}
+
+	st := &jobState{job: job, readySeq: q.nextReadySeq}
+	q.nextReadySeq++
+	q.byID[job.ID] = st
+	if job.IdempotencyKey != "" {
+		q.byKey[job.IdempotencyKey] = job.ID
+	}
+	q.ready = append(q.ready, job.ID)
+	q.persistLocked(st)
+	return job
+}
+
 // Lease returns the oldest ready job and a lease ID for it. The job is
 // reserved until the lease expires or the caller acks or nacks it. When
 // no job is ready, ok is false.
@@ -198,6 +227,18 @@ func (q *Queue) Nack(leaseID string) error {
 	q.ready = append(q.ready, id)
 	q.persistLocked(st)
 	return nil
+}
+
+// Get returns the job with the given ID, reporting whether it exists.
+// Leased jobs are returned too; completed jobs are gone.
+func (q *Queue) Get(id string) (Job, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	st, ok := q.byID[id]
+	if !ok {
+		return Job{}, false
+	}
+	return st.job, true
 }
 
 // Len returns the number of jobs currently in the queue, ready or leased.
